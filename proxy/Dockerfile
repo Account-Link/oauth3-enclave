@@ -10,6 +10,7 @@ RUN npm run build && npm prune --production
 ENV NODE_ENV=production
 ENV PORT=3737
 ENV DB_PATH=/data/proxy.db
+RUN mkdir -p /data
 
 EXPOSE 3737
 CMD ["node", "dist/server.js"]

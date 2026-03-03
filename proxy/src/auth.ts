@@ -57,7 +57,7 @@ function getSecret(): string {
 }
 
 export function issueToken(tenantId: string, role: 'agent' | 'owner' = 'agent', plan = 'free'): string {
-  return signJWT({ tenant_id: tenantId, role, plan }, getSecret())
+  return signJWT({ tenant_id: tenantId, role, plan }, getSecret(), 86400)
 }
 
 // --- Express middleware ---

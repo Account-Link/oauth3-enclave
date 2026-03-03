@@ -86,6 +86,14 @@ export class ProxyDatabase {
         created_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS kv_store (
+        scope TEXT NOT NULL,
+        key TEXT NOT NULL,
+        value TEXT,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (scope, key)
+      );
+
       CREATE INDEX IF NOT EXISTS idx_requests_status ON execution_requests(status);
       CREATE INDEX IF NOT EXISTS idx_requests_created ON execution_requests(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_scope_grants_session ON scope_grants(session_id);
@@ -123,6 +131,12 @@ export class ProxyDatabase {
     if (!sessionCols.has('owner_id')) {
       this.db.exec(`ALTER TABLE sessions ADD COLUMN owner_id TEXT`);
       this.db.exec(`ALTER TABLE sessions ADD COLUMN agent_id TEXT`);
+    }
+    if (!sessionCols.has('expires_at')) {
+      this.db.exec(`ALTER TABLE sessions ADD COLUMN expires_at INTEGER`);
+      this.db.exec(`ALTER TABLE sessions ADD COLUMN bearer_token TEXT`);
+      // Backfill: existing sessions get 30min from last_activity
+      this.db.exec(`UPDATE sessions SET expires_at = last_activity + 1800000 WHERE expires_at IS NULL`);
     }
   }
 
@@ -166,8 +180,30 @@ export class ProxyDatabase {
     pgLog.updateExecutionResult(id, error ? 'failed' : 'completed', error);
   }
 
-  // Cleanup (no more skill_approvals to clean)
-  cleanupExpired(): void {}
+  cleanupExpired(): void {
+    const now = Date.now();
+    const expired = this.db.prepare('SELECT session_id FROM sessions WHERE expires_at IS NOT NULL AND expires_at < ?').all(now) as { session_id: string }[];
+    for (const e of expired) {
+      this.db.prepare('DELETE FROM scope_grants WHERE session_id = ?').run(e.session_id);
+      this.db.prepare('DELETE FROM sessions WHERE session_id = ?').run(e.session_id);
+    }
+    this.db.prepare('DELETE FROM kv_store WHERE ? - updated_at > 86400000').run(now);
+  }
+
+  // KV Store
+
+  kvGet(scope: string, key: string): string | null {
+    const row = this.db.prepare('SELECT value FROM kv_store WHERE scope = ? AND key = ?').get(scope, key) as { value: string } | undefined;
+    return row?.value ?? null;
+  }
+
+  kvSet(scope: string, key: string, value: string): void {
+    this.db.prepare('INSERT OR REPLACE INTO kv_store (scope, key, value, updated_at) VALUES (?, ?, ?, ?)').run(scope, key, value, Date.now());
+  }
+
+  kvDelete(scope: string, key: string): void {
+    this.db.prepare('DELETE FROM kv_store WHERE scope = ? AND key = ?').run(scope, key);
+  }
 
   // Secrets
 
@@ -206,17 +242,18 @@ export class ProxyDatabase {
 
   // Sessions (permits)
 
-  createSession(sessionId: string, policy: SessionPolicy, agentId?: string, ownerId?: string): void {
+  createSession(sessionId: string, policy: SessionPolicy, agentId?: string, ownerId?: string, opts?: { expiresIn?: number; bearerToken?: string }): void {
     const now = Date.now();
-    this.db.prepare('INSERT OR REPLACE INTO sessions (session_id, created_at, last_activity, policy, agent_id, owner_id) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(sessionId, now, now, JSON.stringify(policy), agentId || null, ownerId || null);
+    const expiresAt = now + (opts?.expiresIn || 30 * 60 * 1000);
+    this.db.prepare('INSERT OR REPLACE INTO sessions (session_id, created_at, last_activity, policy, agent_id, owner_id, expires_at, bearer_token) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(sessionId, now, now, JSON.stringify(policy), agentId || null, ownerId || null, expiresAt, opts?.bearerToken || null);
     pgLog.logSession(sessionId, this.tenantId, policy.description);
   }
 
-  getSession(sessionId: string): { session_id: string; created_at: number; last_activity: number; policy: SessionPolicy; agent_id: string | null; owner_id: string | null } | undefined {
+  getSession(sessionId: string): { session_id: string; created_at: number; last_activity: number; policy: SessionPolicy; agent_id: string | null; owner_id: string | null; expires_at: number | null; bearer_token: string | null } | undefined {
     const row = this.db.prepare('SELECT * FROM sessions WHERE session_id = ?').get(sessionId) as any;
     if (!row) return undefined;
-    if (Date.now() - row.last_activity > 2 * 60 * 60 * 1000) {
+    if (row.expires_at && Date.now() > row.expires_at) {
       this.db.prepare('DELETE FROM sessions WHERE session_id = ?').run(sessionId);
       return undefined;
     }
@@ -233,14 +270,24 @@ export class ProxyDatabase {
       .run(JSON.stringify(policy), Date.now(), sessionId);
   }
 
+  getSessionByBearer(token: string): { session_id: string; created_at: number; last_activity: number; policy: SessionPolicy; agent_id: string | null; owner_id: string | null; expires_at: number | null; bearer_token: string | null } | undefined {
+    const row = this.db.prepare('SELECT * FROM sessions WHERE bearer_token = ?').get(token) as any;
+    if (!row) return undefined;
+    if (row.expires_at && Date.now() > row.expires_at) {
+      this.db.prepare('DELETE FROM sessions WHERE session_id = ?').run(row.session_id);
+      return undefined;
+    }
+    return { ...row, policy: JSON.parse(row.policy) };
+  }
+
   deleteSession(sessionId: string): void {
     this.db.prepare('DELETE FROM scope_grants WHERE session_id = ?').run(sessionId);
     this.db.prepare('DELETE FROM sessions WHERE session_id = ?').run(sessionId);
   }
 
-  listSessions(): Array<{ session_id: string; created_at: number; last_activity: number; policy: SessionPolicy; agent_id: string | null; owner_id: string | null }> {
+  listSessions(): Array<{ session_id: string; created_at: number; last_activity: number; policy: SessionPolicy; agent_id: string | null; owner_id: string | null; expires_at: number | null; bearer_token: string | null }> {
     const now = Date.now();
-    const expired = this.db.prepare('SELECT session_id FROM sessions WHERE ? - last_activity > ?').all(now, 2 * 60 * 60 * 1000) as { session_id: string }[];
+    const expired = this.db.prepare('SELECT session_id FROM sessions WHERE expires_at IS NOT NULL AND expires_at < ?').all(now) as { session_id: string }[];
     for (const e of expired) {
       this.db.prepare('DELETE FROM scope_grants WHERE session_id = ?').run(e.session_id);
       this.db.prepare('DELETE FROM sessions WHERE session_id = ?').run(e.session_id);

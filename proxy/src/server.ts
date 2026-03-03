@@ -12,18 +12,21 @@ import { CapabilitySpec, CapabilityFunction, hashSpec, tokenUsage, getPlugin, al
 import { requireTenant, requireOwner, handleSignup, TenantContext, verifyTokenDirect } from './auth.js';
 import * as pgLog from './postgres.js';
 import { randomBytes } from 'crypto';
+import { APPROVE_HTML } from './approve-html.js';
 
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use((_req, res, next) => { res.setHeader('Referrer-Policy', 'no-referrer'); next(); });
 
-// CORS
-const CORS_ORIGIN = process.env.CORS_ORIGIN || 'https://oauth3.app';
+// CORS — bearer-token-authenticated routes are public APIs, origin is irrelevant
+const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (req.url.includes('/approve/')) console.log('[CORS debug]', { origin, referer: req.headers.referer, ua: req.headers['user-agent']?.slice(0, 80), method: req.method });
-  if (origin && (CORS_ORIGIN === '*' || CORS_ORIGIN.split(',').includes(origin))) {
+  if (!origin) return next();
+  const hasBearer = req.headers.authorization?.startsWith('Bearer ')
+    || req.headers['access-control-request-headers']?.toLowerCase().includes('authorization');
+  if (hasBearer || CORS_ORIGIN === '*' || CORS_ORIGIN.split(',').includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
@@ -195,6 +198,10 @@ app.get('/approve/:id', (req: Request, res: Response) => {
   if (!request) return res.status(404).json({ error: 'Not found' });
   if (!token || token !== request.approval_token) return res.status(403).json({ error: 'Invalid token' });
 
+  // Serve HTML approval page for browsers
+  const accept = req.headers.accept || '';
+  if (accept.includes('text/html')) return res.type('html').send(APPROVE_HTML);
+
   const permitReq = getPermitRequest(id);
 
   // If owner token provided, check which secrets they already have
@@ -276,7 +283,10 @@ app.post('/approve/:id', async (req: Request, res: Response) => {
         description: permitReq.description,
         capabilities: permitReq.draftedCapabilities?.length ? permitReq.draftedCapabilities : undefined,
       };
-      db.createSession(permitReq.permitId, policy, agentId, ownerId);
+      const hasCustom = permitReq.capabilities?.some(c => c.type === 'custom');
+      const bearerToken = randomBytes(64).toString('hex');
+      const expiresIn = hasCustom ? 365 * 24 * 60 * 60 * 1000 : 30 * 60 * 1000;
+      db.createSession(permitReq.permitId, policy, agentId, ownerId, { expiresIn, bearerToken });
     }
 
     db.addScopeGrant(permitReq.permitId, permitReq.description, [], permitReq.secrets, permitReq.networks);
@@ -284,7 +294,10 @@ app.post('/approve/:id', async (req: Request, res: Response) => {
     notifyStatusWaiters(id);
     console.log(`📋 Permit approved by owner ${ownerId}, session ${permitReq.permitId} ${existingSession ? 'expanded' : 'created'}`);
 
-    return res.json({ id, status: 'completed', permit_id: permitReq.permitId, expanded: !!existingSession });
+    const session = db.getSession(permitReq.permitId);
+    const result: any = { id, status: 'completed', permit_id: permitReq.permitId, expanded: !!existingSession };
+    if (session?.bearer_token) result.bearer_token = session.bearer_token;
+    return res.json(result);
   }
 
   db.updateRequestStatus(id, 'denied');
@@ -677,7 +690,9 @@ async function executeInBackground(requestId: string, code: string, capabilities
       return;
     }
 
-    const result = await execute({ code, secrets: secretValues, args: execArgs, timeout: 30, capabilities });
+    const kvScope = `exec:${requestId}`;
+    const store = { get: (k: string) => db.kvGet(kvScope, k), set: (k: string, v: string) => db.kvSet(kvScope, k, v), delete: (k: string) => db.kvDelete(kvScope, k) };
+    const result = await execute({ code, secrets: secretValues, args: execArgs, timeout: 30, capabilities, store });
     console.log(`  Execution complete:`, result.success ? '✅' : '❌');
 
     const resultData: any = {
@@ -699,6 +714,51 @@ async function executeInBackground(requestId: string, code: string, capabilities
     notifyStatusWaiters(requestId);
   }
 }
+
+// POST /invoke/:permit_id — call a custom capability directly (bearer token auth)
+app.post('/invoke/:permit_id', async (req: Request, res: Response) => {
+  const permitId = req.params.permit_id;
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'Bearer token required' });
+  const token = auth.slice(7);
+
+  const session = db.getSessionByBearer(token);
+  if (!session) return res.status(401).json({ error: 'Invalid bearer token' });
+  if (session.session_id !== permitId) return res.status(403).json({ error: 'Token does not match permit' });
+
+  const { capability, args } = req.body;
+  if (!capability) return res.status(400).json({ error: 'capability name required' });
+
+  const cap = session.policy.capabilities?.find(c => c.name === capability);
+  if (!cap?.spec || cap.spec.type !== 'custom') return res.status(400).json({ error: `Capability "${capability}" not found or not custom type` });
+
+  const plugin = getPlugin('custom');
+  if (!plugin) return res.status(500).json({ error: 'Custom plugin not registered' });
+
+  const ownerSecrets = session.owner_id ? db.getSecretsByOwner(session.owner_id) : {};
+  const secretValues: Record<string, string> = {};
+  for (const name of plugin.extractSecrets(cap.spec)) {
+    if (!ownerSecrets[name]) return res.status(500).json({ error: `Missing secret: ${name}` });
+    secretValues[name] = ownerSecrets[name];
+  }
+
+  const kvScope = `custom:${permitId}:${capability}`;
+  const store = {
+    get: (k: string) => db.kvGet(kvScope, k),
+    set: (k: string, v: string) => db.kvSet(kvScope, k, v),
+    delete: (k: string) => db.kvDelete(kvScope, k),
+  };
+
+  try {
+    const result = await plugin.codegen(cap.spec);
+    const fn = result.endowment.build(secretValues, store);
+    const fnResult = await fn(...(Array.isArray(args) ? args : []));
+    db.touchSession(permitId);
+    res.json({ result: fnResult });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // JSON 404
 app.use((_req: Request, res: Response) => {
