@@ -50,8 +50,8 @@ const ORCHESTRATOR_URL = (process.env.ORCHESTRATOR_URL || '').replace(/\/+$/, ''
 function buildApprovalUrl(requestId: string, approvalToken: string, req: any): string | undefined {
   const orchHeader = req.headers['x-orchestrator-url'] as string | undefined;
   const orchTenant = req.headers['x-tenant-id'] as string | undefined;
-  if (orchHeader && orchTenant) return `${orchHeader}/t/${orchTenant}/approve/${requestId}?token=${approvalToken}`;
-  if (ORCHESTRATOR_URL) return `${ORCHESTRATOR_URL}/approve/${requestId}?token=${approvalToken}`;
+  if (orchHeader && orchTenant) return `${orchHeader}/t/${orchTenant}/approve/${requestId}?token=${approvalToken}&tee=${encodeURIComponent(PUBLIC_URL)}`;
+  if (ORCHESTRATOR_URL) return `${ORCHESTRATOR_URL}/approve/${requestId}?token=${approvalToken}&tee=${encodeURIComponent(PUBLIC_URL)}`;
   if (PUBLIC_URL) return `${PUBLIC_URL}/approve/${requestId}?token=${approvalToken}`;
   return undefined;
 }
