@@ -30,7 +30,7 @@ button{padding:10px 24px;border:none;border-radius:6px;font-family:inherit;font-
 var params = new URLSearchParams(location.search);
 var ID = location.pathname.split('/approve/')[1];
 var TOKEN = params.get('token') || '';
-var OWNER_TOKEN = params.get('owner_token') || '';
+var OWNER_TOKEN = params.get('owner_token') || localStorage.getItem('oauth3_jwt') || '';
 var $ = function(s){return document.getElementById(s)};
 
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}

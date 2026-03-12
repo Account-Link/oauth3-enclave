@@ -4,15 +4,15 @@
 
 services:
   dstack-ingress:
-    image: dstacktee/dstack-ingress:20250929@sha256:2b47b3e538df0b3e7724255b89369194c8c83a7cfba64d2faf0115ad0a586458
+    image: dstacktee/dstack-ingress:1.3@sha256:875ea58172b33cbb3e130dce2ff44b36c05f2153c434dc1ef02798d5994716cf
     ports:
       - "443:443"
     environment:
-      DOMAIN: ${DOMAIN}
+      DOMAIN: tee.oauth3-stage.monerolink.com
       DNS_PROVIDER: cloudflare
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
-      GATEWAY_DOMAIN: ${GATEWAY_DOMAIN:-_.dstack-pha-prod9.phala.network}
-      CERTBOT_EMAIL: ${CERTBOT_EMAIL:-amiller@oauth3.net}
+      GATEWAY_DOMAIN: _.dstack-pha-prod9.phala.network
+      CERTBOT_EMAIL: amiller@oauth3.net
       SET_CAA: "true"
       TARGET_ENDPOINT: http://oauth3-proxy:3737
     volumes:
@@ -22,22 +22,46 @@ services:
     restart: unless-stopped
 
   oauth3-proxy:
-    image: ghcr.io/amiller/oauth3-proxy@sha256:bc5f3586638009f6489ab0c2333d36fa7b11f43f0a20768c427c3e3fc9ad0ce4
+    image: ghcr.io/amiller/oauth3-proxy@sha256:e184dfd7464db32168aed80b4dc116c0dc853ab01c8ae9db9d0867e9240a454d
     ports:
       - "3737:3737"
     environment:
       PORT: "3737"
       DB_PATH: /data/proxy.db
       DATABASE_URL: postgres://${PG_USER:-oauth3}:${PG_PASSWORD}@postgres:5432/${PG_DB:-oauth3}
-      CORS_ORIGIN: ${CORS_ORIGIN}
+      CORS_ORIGIN: https://oauth3-stage.monerolink.com,https://amiller.github.io
       JWT_SECRET: ${JWT_SECRET:-}
-      PUBLIC_URL: https://${DOMAIN}
-      ORCHESTRATOR_URL: ${ORCHESTRATOR_URL:-}
+      PUBLIC_URL: https://tee.oauth3-stage.monerolink.com
+      ORCHESTRATOR_URL: https://oauth3-stage.monerolink.com
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     volumes:
       - oauth3-data:/data
+    restart: unless-stopped
+
+  # gost: local unauthenticated SOCKS5 that forwards to remote authenticated WG proxy.
+  # Chromium/Playwright can't do authenticated SOCKS5, so gost bridges the gap.
+  # Same pattern as borgcube's chisel-client containers.
+  socks5-relay:
+    image: ginuerzh/gost:latest
+    command:
+      - "-L=:1080"
+      - "-F=socks5://${WG_PROXY_USER}:${WG_PROXY_PASS}@${WG_PROXY_HOST:-162.251.235.137}:${WG_PROXY_PORT:-10800}"
+    restart: unless-stopped
+
+  # Browser service: headless Playwright behind VPN for cookie-authenticated fetches.
+  # Upgrade path: replace with Envoy Neko container for persistent "teleport browser".
+  # See browser/README.md for details.
+  browser:
+    image: ghcr.io/amiller/oauth3-browser@sha256:d2a16a9ce76ec7897c5f47a468634f120c9ef9c23223a95b17ece904964315b5
+    expose:
+      - "3000"
+    shm_size: 1gb
+    environment:
+      PROXY_URL: socks5://socks5-relay:1080
+    depends_on:
+      - socks5-relay
     restart: unless-stopped
 
   ssh:
