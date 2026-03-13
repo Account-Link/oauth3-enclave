@@ -159,6 +159,7 @@ app.get('/sessions', requireTenant, syncTenant, (req: Request, res: Response) =>
   res.json({
     sessions: filtered.map(s => ({
       permit_id: s.session_id,
+      ...(tenant.role === 'owner' && s.bearer_token ? { bearer_token: s.bearer_token } : {}),
       created_at: s.created_at,
       last_activity: s.last_activity,
       age_minutes: Math.round((Date.now() - s.created_at) / 60000),
