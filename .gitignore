@@ -13,4 +13,5 @@ references/
 .vercel
 .claude/
 dstack/.env
+dstack/.env.*
 dstack/AGENT_*.md
