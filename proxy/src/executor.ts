@@ -1,6 +1,7 @@
 import './ses-init.js'
 import { createHash } from 'crypto'
 import { CapabilityFunction } from './capability.js'
+import { StoreContext } from './plugins/types.js'
 
 export interface ExecutionRequest {
   code: string
@@ -8,6 +9,7 @@ export interface ExecutionRequest {
   args?: Record<string, any>
   timeout?: number
   capabilities?: CapabilityFunction[]
+  store?: StoreContext
 }
 
 export interface ExecutionResult {
@@ -35,7 +37,7 @@ export async function execute(request: ExecutionRequest): Promise<ExecutionResul
     for (const cap of request.capabilities || []) {
       if (!cap.endowment) continue
       const fnName = cap.name.split('.').pop()!
-      endowments[fnName] = harden(cap.endowment.build(request.secrets))
+      endowments[fnName] = harden(cap.endowment.build(request.secrets, request.store))
     }
 
     endowments.args = harden(request.args || {})

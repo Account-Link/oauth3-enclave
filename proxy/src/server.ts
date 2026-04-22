@@ -11,19 +11,24 @@ import { execute, hashCode } from './executor.js';
 import { CapabilitySpec, CapabilityFunction, hashSpec, tokenUsage, getPlugin, allPlugins } from './capability.js';
 import { requireTenant, requireOwner, handleSignup, TenantContext, verifyTokenDirect } from './auth.js';
 import * as pgLog from './postgres.js';
-import { randomBytes } from 'crypto';
+import { randomBytes, createECDH } from 'crypto';
+import webpush from 'web-push';
+import http from 'http';
+import { APPROVE_HTML } from './approve-html.js';
 
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use((_req, res, next) => { res.setHeader('Referrer-Policy', 'no-referrer'); next(); });
 
-// CORS
-const CORS_ORIGIN = process.env.CORS_ORIGIN || 'https://oauth3.app';
+// CORS — bearer-token-authenticated routes are public APIs, origin is irrelevant
+const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (req.url.includes('/approve/')) console.log('[CORS debug]', { origin, referer: req.headers.referer, ua: req.headers['user-agent']?.slice(0, 80), method: req.method });
-  if (origin && (CORS_ORIGIN === '*' || CORS_ORIGIN.split(',').includes(origin))) {
+  if (!origin) return next();
+  const hasBearer = req.headers.authorization?.startsWith('Bearer ')
+    || req.headers['access-control-request-headers']?.toLowerCase().includes('authorization');
+  if (hasBearer || CORS_ORIGIN === '*' || CORS_ORIGIN.split(',').includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
@@ -103,6 +108,29 @@ app.get('/plugins', (_req: Request, res: Response) => {
 });
 
 app.get('/health', (_req: Request, res: Response) => res.json({ status: 'ok' }));
+
+app.get('/tee/info', (_req: Request, res: Response) => {
+  try {
+    const raw: Buffer[] = [];
+    const proxyReq = http.request(
+      { socketPath: '/var/run/dstack.sock', path: '/prpc/Worker.Info', method: 'POST',
+        headers: { 'Content-Type': 'application/json' } },
+      (proxyRes) => {
+        proxyRes.on('data', (chunk: Buffer) => raw.push(chunk));
+        proxyRes.on('end', () => {
+          const body = Buffer.concat(raw).toString();
+          res.status(proxyRes.statusCode || 200).setHeader('Content-Type', 'application/json').send(body);
+        });
+      },
+    );
+    proxyReq.setTimeout(5000, () => { proxyReq.destroy(); res.status(504).json({ error: 'timeout' }); });
+    proxyReq.on('error', (e: Error) => { if (!res.headersSent) res.status(502).json({ error: e.message }); });
+    proxyReq.write('{}');
+    proxyReq.end();
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
 app.post('/signup', handleSignup);
 
 app.get('/dashboard', requireTenant, syncTenant, (req: Request, res: Response) => {
@@ -156,6 +184,7 @@ app.get('/sessions', requireTenant, syncTenant, (req: Request, res: Response) =>
   res.json({
     sessions: filtered.map(s => ({
       permit_id: s.session_id,
+      ...(tenant.role === 'owner' && s.bearer_token ? { bearer_token: s.bearer_token } : {}),
       created_at: s.created_at,
       last_activity: s.last_activity,
       age_minutes: Math.round((Date.now() - s.created_at) / 60000),
@@ -194,6 +223,10 @@ app.get('/approve/:id', (req: Request, res: Response) => {
   const request = db.getRequest(id);
   if (!request) return res.status(404).json({ error: 'Not found' });
   if (!token || token !== request.approval_token) return res.status(403).json({ error: 'Invalid token' });
+
+  // Serve HTML approval page for browsers
+  const accept = req.headers.accept || '';
+  if (accept.includes('text/html')) return res.type('html').send(APPROVE_HTML);
 
   const permitReq = getPermitRequest(id);
 
@@ -276,7 +309,10 @@ app.post('/approve/:id', async (req: Request, res: Response) => {
         description: permitReq.description,
         capabilities: permitReq.draftedCapabilities?.length ? permitReq.draftedCapabilities : undefined,
       };
-      db.createSession(permitReq.permitId, policy, agentId, ownerId);
+      const hasCustom = permitReq.capabilities?.some(c => c.type === 'custom');
+      const bearerToken = randomBytes(64).toString('hex');
+      const expiresIn = hasCustom ? 365 * 24 * 60 * 60 * 1000 : 30 * 60 * 1000;
+      db.createSession(permitReq.permitId, policy, agentId, ownerId, { expiresIn, bearerToken });
     }
 
     db.addScopeGrant(permitReq.permitId, permitReq.description, [], permitReq.secrets, permitReq.networks);
@@ -284,7 +320,10 @@ app.post('/approve/:id', async (req: Request, res: Response) => {
     notifyStatusWaiters(id);
     console.log(`📋 Permit approved by owner ${ownerId}, session ${permitReq.permitId} ${existingSession ? 'expanded' : 'created'}`);
 
-    return res.json({ id, status: 'completed', permit_id: permitReq.permitId, expanded: !!existingSession });
+    const session = db.getSession(permitReq.permitId);
+    const result: any = { id, status: 'completed', permit_id: permitReq.permitId, expanded: !!existingSession };
+    if (session?.bearer_token) result.bearer_token = session.bearer_token;
+    return res.json(result);
   }
 
   db.updateRequestStatus(id, 'denied');
@@ -677,7 +716,9 @@ async function executeInBackground(requestId: string, code: string, capabilities
       return;
     }
 
-    const result = await execute({ code, secrets: secretValues, args: execArgs, timeout: 30, capabilities });
+    const kvScope = `exec:${requestId}`;
+    const store = { get: (k: string) => db.kvGet(kvScope, k), set: (k: string, v: string) => db.kvSet(kvScope, k, v), delete: (k: string) => db.kvDelete(kvScope, k) };
+    const result = await execute({ code, secrets: secretValues, args: execArgs, timeout: 30, capabilities, store });
     console.log(`  Execution complete:`, result.success ? '✅' : '❌');
 
     const resultData: any = {
@@ -699,6 +740,151 @@ async function executeInBackground(requestId: string, code: string, capabilities
     notifyStatusWaiters(requestId);
   }
 }
+
+// POST /invoke/:permit_id — call a custom capability directly (bearer token auth)
+app.post('/invoke/:permit_id', async (req: Request, res: Response) => {
+  const permitId = req.params.permit_id;
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'Bearer token required' });
+  const token = auth.slice(7);
+
+  const session = db.getSessionByBearer(token);
+  if (!session) return res.status(401).json({ error: 'Invalid bearer token' });
+  if (session.session_id !== permitId) return res.status(403).json({ error: 'Token does not match permit' });
+
+  const { capability, args } = req.body;
+  if (!capability) return res.status(400).json({ error: 'capability name required' });
+
+  const cap = session.policy.capabilities?.find(c => c.name === capability);
+  if (!cap?.spec || cap.spec.type !== 'custom') return res.status(400).json({ error: `Capability "${capability}" not found or not custom type` });
+
+  const plugin = getPlugin('custom');
+  if (!plugin) return res.status(500).json({ error: 'Custom plugin not registered' });
+
+  const ownerSecrets = session.owner_id ? db.getSecretsByOwner(session.owner_id) : {};
+  const secretValues: Record<string, string> = {};
+  for (const name of plugin.extractSecrets(cap.spec)) {
+    if (!ownerSecrets[name]) return res.status(500).json({ error: `Missing secret: ${name}` });
+    secretValues[name] = ownerSecrets[name];
+  }
+
+  const kvScope = `custom:${permitId}:${capability}`;
+  const store = {
+    get: (k: string) => db.kvGet(kvScope, k),
+    set: (k: string, v: string) => db.kvSet(kvScope, k, v),
+    delete: (k: string) => db.kvDelete(kvScope, k),
+  };
+
+  try {
+    const result = await plugin.codegen(cap.spec);
+    const refreshSecret = (name: string, value: string) => { if (session.owner_id) db.setSecret(name, value, session.owner_id); };
+    const fn = result.endowment.build(secretValues, store, refreshSecret);
+    const fnResult = await fn(...(Array.isArray(args) ? args : []));
+    db.touchSession(permitId);
+    res.json({ result: fnResult });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- Web Push relay ---
+
+let cachedVapidKeys: { publicKey: string; privateKey: string } | null = null;
+
+function deriveVapidKeys(): Promise<{ publicKey: string; privateKey: string }> {
+  if (cachedVapidKeys) return Promise.resolve(cachedVapidKeys);
+  return new Promise((resolve, reject) => {
+    const raw: Buffer[] = [];
+    const req = http.request(
+      { socketPath: '/var/run/tappd.sock', path: '/prpc/Dstack.DeriveKey', method: 'POST',
+        headers: { 'Content-Type': 'application/json' } },
+      (proxyRes) => {
+        proxyRes.on('data', (chunk: Buffer) => raw.push(chunk));
+        proxyRes.on('end', () => {
+          try {
+            const body = JSON.parse(Buffer.concat(raw).toString());
+            const keyBytes = Buffer.from(body.key, 'hex').slice(0, 32);
+            const ecdh = createECDH('prime256v1');
+            ecdh.setPrivateKey(keyBytes);
+            cachedVapidKeys = {
+              publicKey: ecdh.getPublicKey().toString('base64url'),
+              privateKey: keyBytes.toString('base64url'),
+            };
+            resolve(cachedVapidKeys);
+          } catch (e) {
+            reject(new Error('VAPID: dstack key parse failed — cannot generate stable keys'));
+          }
+        });
+      },
+    );
+    req.setTimeout(5000, () => { req.destroy(); reject(new Error('VAPID: dstack socket timeout — cannot generate stable keys')); });
+    req.on('error', (e) => { reject(new Error(`VAPID: dstack socket error — ${e.message}`)); });
+    req.write(JSON.stringify({ path: '/vapid' }));
+    req.end();
+  });
+}
+
+app.get('/push/vapid-key', async (_req: Request, res: Response) => {
+  try {
+    const keys = await deriveVapidKeys();
+    res.json({ publicKey: keys.publicKey });
+  } catch (e: any) {
+    res.status(503).json({ error: e.message });
+  }
+});
+
+app.post('/push/subscribe', requireTenant, syncTenant, requireOwner, (req: Request, res: Response) => {
+  const tenant = (req as any).tenant as TenantContext;
+  const { subscription } = req.body;
+  if (!subscription?.endpoint) return res.status(400).json({ error: 'subscription with endpoint required' });
+  // Dedup: remove existing subscriptions with the same endpoint
+  const existing = db.getSecretsByOwner(tenant.tenant_id);
+  for (const [key, val] of Object.entries(existing)) {
+    if (!key.startsWith('PUSH_SUB_')) continue;
+    try { if (JSON.parse(val).endpoint === subscription.endpoint) db.deleteSecret(key, tenant.tenant_id); } catch {}
+  }
+  const name = `PUSH_SUB_${Date.now()}_${randomBytes(4).toString('hex')}`;
+  db.setSecret(name, JSON.stringify(subscription), tenant.tenant_id);
+  res.json({ success: true, name });
+});
+
+const pushCooldowns = new Map<string, number>();
+
+app.post('/push/send', requireTenant, syncTenant, requireOwner, async (req: Request, res: Response) => {
+  const tenant = (req as any).tenant as TenantContext;
+  const now = Date.now();
+  const lastSend = pushCooldowns.get(tenant.tenant_id) || 0;
+  if (now - lastSend < 10_000) return res.status(429).json({ error: 'Rate limited — wait 10s between sends' });
+  pushCooldowns.set(tenant.tenant_id, now);
+  const { title, body: msgBody, url } = req.body;
+  if (!title) return res.status(400).json({ error: 'title required' });
+  const keys = await deriveVapidKeys();
+  const subject = process.env.VAPID_SUBJECT || 'mailto:admin@oauth3.net';
+  const secrets = db.getSecretsByOwner(tenant.tenant_id);
+  const entries = Object.entries(secrets)
+    .filter(([k]) => k.startsWith('PUSH_SUB_'))
+    .map(([key, v]) => { try { return { key, sub: JSON.parse(v) }; } catch { return null; } })
+    .filter((e): e is { key: string; sub: any } => e !== null);
+  if (entries.length === 0) return res.status(404).json({ error: 'No push subscriptions found' });
+  const payload = JSON.stringify({ title, body: msgBody || '', url: url || '' });
+  const results = await Promise.allSettled(
+    entries.map(({ sub }) => webpush.sendNotification(sub, payload, {
+      vapidDetails: { subject, publicKey: keys.publicKey, privateKey: keys.privateKey },
+    })),
+  );
+  const sent = results.filter(r => r.status === 'fulfilled').length;
+  const failed = results.filter(r => r.status === 'rejected').length;
+  // Clean up expired subscriptions (410 Gone)
+  for (let i = 0; i < results.length; i++) {
+    if (results[i].status === 'rejected') {
+      const err = (results[i] as PromiseRejectedResult).reason;
+      if (err?.statusCode === 410) {
+        db.deleteSecret(entries[i].key, tenant.tenant_id);
+      }
+    }
+  }
+  res.json({ sent, failed });
+});
 
 // JSON 404
 app.use((_req: Request, res: Response) => {

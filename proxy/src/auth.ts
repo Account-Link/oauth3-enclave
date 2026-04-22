@@ -1,4 +1,4 @@
-import { createHmac, randomBytes } from 'crypto'
+import { createHash, createHmac, randomBytes } from 'crypto'
 import { Request, Response, NextFunction } from 'express'
 
 const JWT_SECRET = process.env.JWT_SECRET || ''
@@ -57,7 +57,8 @@ function getSecret(): string {
 }
 
 export function issueToken(tenantId: string, role: 'agent' | 'owner' = 'agent', plan = 'free'): string {
-  return signJWT({ tenant_id: tenantId, role, plan }, getSecret())
+  const ttl = role === 'owner' ? 365 * 86400 : 86400
+  return signJWT({ tenant_id: tenantId, role, plan }, getSecret(), ttl)
 }
 
 // --- Express middleware ---
@@ -94,11 +95,13 @@ export function requireOwner(req: Request, res: Response, next: NextFunction) {
 }
 
 export function handleSignup(req: Request, res: Response) {
-  const { name, role } = req.body || {}
+  const { name, role, email } = req.body || {}
   const effectiveRole = role === 'owner' ? 'owner' : 'agent'
-  const tenantId = `tenant_${randomBytes(8).toString('hex')}`
+  const tenantId = email
+    ? createHash('sha256').update(email).digest('hex').slice(0, 16)
+    : `tenant_${randomBytes(8).toString('hex')}`
   const token = issueToken(tenantId, effectiveRole)
-  res.json({ tenant_id: tenantId, role: effectiveRole, token, message: 'Store this token — it cannot be recovered' })
+  res.json({ tenant_id: tenantId, role: effectiveRole, token })
 }
 
 export function verifyTokenDirect(token: string): TenantContext | null {

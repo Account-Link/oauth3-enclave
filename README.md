@@ -124,8 +124,12 @@ proxy/src/
     └── scoped-fetch.ts # URL globs, methods, body schema, rate limits
 dstack/
 ├── docker-compose.yml  # CVM deployment
-└── .env.staging        # Env template
+└── .env.production     # Env template (secrets in gitignored .env.staging)
 ```
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for the full security model: where secrets are stored, how volumes are encrypted (LUKS2 with TEE-derived keys), authentication token lifecycle, data loss scenarios, and known Stage 0 limitations.
 
 ## License
 

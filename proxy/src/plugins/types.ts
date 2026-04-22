@@ -1,7 +1,13 @@
 import { PolicyConstraint } from '../capability.js'
 
+export interface StoreContext {
+  get(key: string): string | null
+  set(key: string, value: string): void
+  delete(key: string): void
+}
+
 export interface EndowmentFactory {
-  build(secrets: Record<string, string>): (...args: any[]) => Promise<any>
+  build(secrets: Record<string, string>, store?: StoreContext, refreshSecret?: (name: string, value: string) => void): (...args: any[]) => Promise<any>
 }
 
 export interface PluginCodegenResult {
