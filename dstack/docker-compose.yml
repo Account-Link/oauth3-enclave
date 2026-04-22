@@ -22,7 +22,7 @@ services:
     restart: unless-stopped
 
   oauth3-proxy:
-    image: ghcr.io/amiller/oauth3-proxy@sha256:e184dfd7464db32168aed80b4dc116c0dc853ab01c8ae9db9d0867e9240a454d
+    image: ghcr.io/amiller/oauth3-proxy@sha256:2dfd4bb73c745e2af148842e6b14def70e51e508b7085e60150871c2467423a6
     ports:
       - "3737:3737"
     environment:
@@ -56,7 +56,7 @@ services:
   # Upgrade path: replace with Envoy Neko container for persistent "teleport browser".
   # See browser/README.md for details.
   browser:
-    image: ghcr.io/amiller/oauth3-browser@sha256:d2a16a9ce76ec7897c5f47a468634f120c9ef9c23223a95b17ece904964315b5
+    image: ghcr.io/amiller/oauth3-browser@sha256:75c6c946f9a6c321152976d096da696bdd80c791478811f479ab74dca36ad778
     expose:
       - "3000"
     shm_size: 1gb
