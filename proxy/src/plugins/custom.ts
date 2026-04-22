@@ -30,11 +30,11 @@ function codegen(spec: CustomSpec): Promise<PluginCodegenResult> {
   const params = parseParams(spec.signature)
 
   const endowment: EndowmentFactory = {
-    build(secretValues, store) {
+    build(secretValues, store, refreshSecret) {
       const wrappedCode = `return (async () => { ${spec.code} })()`
-      const fn = new Function('fetch', 'secrets', 'store', ...params, wrappedCode)
+      const fn = new Function('fetch', 'secrets', 'store', 'refreshSecret', ...params, wrappedCode)
       return async (...args: any[]) => {
-        return await fn(fetch, secretValues, store, ...args)
+        return await fn(fetch, secretValues, store, refreshSecret || (() => {}), ...args)
       }
     }
   }

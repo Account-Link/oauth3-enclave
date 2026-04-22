@@ -21,6 +21,7 @@ async function handleBrowse(req, res) {
     } else {
       result = { status: response.status(), url: page.url(), body: await page.content() };
     }
+    result.cookies = await context.cookies();
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(result));

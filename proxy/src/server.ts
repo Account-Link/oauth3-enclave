@@ -776,7 +776,8 @@ app.post('/invoke/:permit_id', async (req: Request, res: Response) => {
 
   try {
     const result = await plugin.codegen(cap.spec);
-    const fn = result.endowment.build(secretValues, store);
+    const refreshSecret = (name: string, value: string) => { if (session.owner_id) db.setSecret(name, value, session.owner_id); };
+    const fn = result.endowment.build(secretValues, store, refreshSecret);
     const fnResult = await fn(...(Array.isArray(args) ? args : []));
     db.touchSession(permitId);
     res.json({ result: fnResult });

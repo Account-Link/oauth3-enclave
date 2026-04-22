@@ -7,7 +7,7 @@ export interface StoreContext {
 }
 
 export interface EndowmentFactory {
-  build(secrets: Record<string, string>, store?: StoreContext): (...args: any[]) => Promise<any>
+  build(secrets: Record<string, string>, store?: StoreContext, refreshSecret?: (name: string, value: string) => void): (...args: any[]) => Promise<any>
 }
 
 export interface PluginCodegenResult {
