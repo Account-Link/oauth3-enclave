@@ -12,6 +12,7 @@ import { CapabilitySpec, CapabilityFunction, hashSpec, tokenUsage, getPlugin, al
 import { requireTenant, requireOwner, handleSignup, TenantContext, verifyTokenDirect } from './auth.js';
 import * as pgLog from './postgres.js';
 import { randomBytes } from 'crypto';
+import http from 'http';
 import { APPROVE_HTML } from './approve-html.js';
 
 const app = express();
@@ -106,6 +107,29 @@ app.get('/plugins', (_req: Request, res: Response) => {
 });
 
 app.get('/health', (_req: Request, res: Response) => res.json({ status: 'ok' }));
+
+app.get('/tee/info', (_req: Request, res: Response) => {
+  try {
+    const raw: Buffer[] = [];
+    const proxyReq = http.request(
+      { socketPath: '/var/run/dstack.sock', path: '/prpc/Worker.Info', method: 'POST',
+        headers: { 'Content-Type': 'application/json' } },
+      (proxyRes) => {
+        proxyRes.on('data', (chunk: Buffer) => raw.push(chunk));
+        proxyRes.on('end', () => {
+          const body = Buffer.concat(raw).toString();
+          res.status(proxyRes.statusCode || 200).setHeader('Content-Type', 'application/json').send(body);
+        });
+      },
+    );
+    proxyReq.setTimeout(5000, () => { proxyReq.destroy(); res.status(504).json({ error: 'timeout' }); });
+    proxyReq.on('error', (e: Error) => { if (!res.headersSent) res.status(502).json({ error: e.message }); });
+    proxyReq.write('{}');
+    proxyReq.end();
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
 app.post('/signup', handleSignup);
 
 app.get('/dashboard', requireTenant, syncTenant, (req: Request, res: Response) => {
