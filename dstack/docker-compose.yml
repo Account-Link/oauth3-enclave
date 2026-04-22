@@ -36,8 +36,10 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      VAPID_SUBJECT: mailto:amiller@oauth3.net
     volumes:
       - oauth3-data:/data
+      - /var/run/tappd.sock:/var/run/tappd.sock
     restart: unless-stopped
 
   # gost: local unauthenticated SOCKS5 that forwards to remote authenticated WG proxy.

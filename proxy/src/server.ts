@@ -11,7 +11,8 @@ import { execute, hashCode } from './executor.js';
 import { CapabilitySpec, CapabilityFunction, hashSpec, tokenUsage, getPlugin, allPlugins } from './capability.js';
 import { requireTenant, requireOwner, handleSignup, TenantContext, verifyTokenDirect } from './auth.js';
 import * as pgLog from './postgres.js';
-import { randomBytes } from 'crypto';
+import { randomBytes, createECDH } from 'crypto';
+import webpush from 'web-push';
 import http from 'http';
 import { APPROVE_HTML } from './approve-html.js';
 
@@ -784,6 +785,105 @@ app.post('/invoke/:permit_id', async (req: Request, res: Response) => {
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
+});
+
+// --- Web Push relay ---
+
+let cachedVapidKeys: { publicKey: string; privateKey: string } | null = null;
+
+function deriveVapidKeys(): Promise<{ publicKey: string; privateKey: string }> {
+  if (cachedVapidKeys) return Promise.resolve(cachedVapidKeys);
+  return new Promise((resolve, reject) => {
+    const raw: Buffer[] = [];
+    const req = http.request(
+      { socketPath: '/var/run/tappd.sock', path: '/prpc/Dstack.DeriveKey', method: 'POST',
+        headers: { 'Content-Type': 'application/json' } },
+      (proxyRes) => {
+        proxyRes.on('data', (chunk: Buffer) => raw.push(chunk));
+        proxyRes.on('end', () => {
+          try {
+            const body = JSON.parse(Buffer.concat(raw).toString());
+            const keyBytes = Buffer.from(body.key, 'hex').slice(0, 32);
+            const ecdh = createECDH('prime256v1');
+            ecdh.setPrivateKey(keyBytes);
+            cachedVapidKeys = {
+              publicKey: ecdh.getPublicKey().toString('base64url'),
+              privateKey: keyBytes.toString('base64url'),
+            };
+            resolve(cachedVapidKeys);
+          } catch (e) {
+            reject(new Error('VAPID: dstack key parse failed — cannot generate stable keys'));
+          }
+        });
+      },
+    );
+    req.setTimeout(5000, () => { req.destroy(); reject(new Error('VAPID: dstack socket timeout — cannot generate stable keys')); });
+    req.on('error', (e) => { reject(new Error(`VAPID: dstack socket error — ${e.message}`)); });
+    req.write(JSON.stringify({ path: '/vapid' }));
+    req.end();
+  });
+}
+
+app.get('/push/vapid-key', async (_req: Request, res: Response) => {
+  try {
+    const keys = await deriveVapidKeys();
+    res.json({ publicKey: keys.publicKey });
+  } catch (e: any) {
+    res.status(503).json({ error: e.message });
+  }
+});
+
+app.post('/push/subscribe', requireTenant, syncTenant, requireOwner, (req: Request, res: Response) => {
+  const tenant = (req as any).tenant as TenantContext;
+  const { subscription } = req.body;
+  if (!subscription?.endpoint) return res.status(400).json({ error: 'subscription with endpoint required' });
+  // Dedup: remove existing subscriptions with the same endpoint
+  const existing = db.getSecretsByOwner(tenant.tenant_id);
+  for (const [key, val] of Object.entries(existing)) {
+    if (!key.startsWith('PUSH_SUB_')) continue;
+    try { if (JSON.parse(val).endpoint === subscription.endpoint) db.deleteSecret(key, tenant.tenant_id); } catch {}
+  }
+  const name = `PUSH_SUB_${Date.now()}_${randomBytes(4).toString('hex')}`;
+  db.setSecret(name, JSON.stringify(subscription), tenant.tenant_id);
+  res.json({ success: true, name });
+});
+
+const pushCooldowns = new Map<string, number>();
+
+app.post('/push/send', requireTenant, syncTenant, requireOwner, async (req: Request, res: Response) => {
+  const tenant = (req as any).tenant as TenantContext;
+  const now = Date.now();
+  const lastSend = pushCooldowns.get(tenant.tenant_id) || 0;
+  if (now - lastSend < 10_000) return res.status(429).json({ error: 'Rate limited — wait 10s between sends' });
+  pushCooldowns.set(tenant.tenant_id, now);
+  const { title, body: msgBody, url } = req.body;
+  if (!title) return res.status(400).json({ error: 'title required' });
+  const keys = await deriveVapidKeys();
+  const subject = process.env.VAPID_SUBJECT || 'mailto:admin@oauth3.net';
+  const secrets = db.getSecretsByOwner(tenant.tenant_id);
+  const entries = Object.entries(secrets)
+    .filter(([k]) => k.startsWith('PUSH_SUB_'))
+    .map(([key, v]) => { try { return { key, sub: JSON.parse(v) }; } catch { return null; } })
+    .filter((e): e is { key: string; sub: any } => e !== null);
+  if (entries.length === 0) return res.status(404).json({ error: 'No push subscriptions found' });
+  const payload = JSON.stringify({ title, body: msgBody || '', url: url || '' });
+  const results = await Promise.allSettled(
+    entries.map(({ sub }) => webpush.sendNotification(sub, payload, {
+      vapidDetails: { subject, publicKey: keys.publicKey, privateKey: keys.privateKey },
+    })),
+  );
+  const sent = results.filter(r => r.status === 'fulfilled').length;
+  const failed = results.filter(r => r.status === 'rejected').length;
+  // Clean up expired subscriptions (410 Gone)
+  for (let i = 0; i < results.length; i++) {
+    if (results[i].status === 'rejected') {
+      const err = (results[i] as PromiseRejectedResult).reason;
+      if (err?.statusCode === 410) {
+        db.deleteSecret(entries[i].key, tenant.tenant_id);
+      }
+    }
+  }
+  res.json({ sent, failed });
 });
 
 // JSON 404
